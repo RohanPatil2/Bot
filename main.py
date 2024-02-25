@@ -9,7 +9,7 @@ import openai
 from htmlTemplates import css, user_template, bot_template
 
 # Set your OpenAI API key
-openai.api_key = "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"
+openai.api_key = "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"
 
 def create_users_db():
     conn = sqlite3.connect('MASTER.db')
