@@ -1,199 +1,205 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import re
 from dotenv import load_dotenv
 import sqlite3
 import openai
+import hashlib
+import os
+from datetime import datetime, timedelta
 from htmlTemplates import css, user_template, bot_template
 
-# Set your OpenAI API key
-openai.api_key = ""
+# Configuration
+openai.api_key = os.getenv("OPENAI_API_KEY")
+CACHE_EXPIRY = 3600  # 1 hour cache
+DEFAULT_START_DATE = datetime.now() - timedelta(days=365*2)
+
+# Technical Indicators
+def calculate_technical_indicators(df, window=20):
+    df['SMA'] = df['Close'].rolling(window=window).mean()
+    df['EMA'] = df['Close'].ewm(span=window, adjust=False).mean()
+    
+    # Calculate Bollinger Bands
+    df['STD'] = df['Close'].rolling(window=window).std()
+    df['Upper Band'] = df['SMA'] + (df['STD'] * 2)
+    df['Lower Band'] = df['SMA'] - (df['STD'] * 2)
+    
+    # Calculate RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    return df.dropna()
+
+# Enhanced Authentication
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
 def create_users_db():
-    conn = sqlite3.connect('MASTER.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS Users (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT,
-            password TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('MASTER.db') as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS Users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 def add_user_to_db(email, password):
-    conn = sqlite3.connect('MASTER.db')
-    cursor = conn.cursor()
-    insert_query = """
-        INSERT INTO Users (email, password)
-        VALUES (?, ?)
-    """
-    cursor.execute(insert_query, (email, password))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('MASTER.db') as conn:
+        password_hash = hash_password(password)
+        conn.execute("""
+            INSERT INTO Users (email, password_hash)
+            VALUES (?, ?)
+        """, (email, password_hash))
 
 def authenticate_user(email, password):
-    conn = sqlite3.connect('MASTER.db')
-    cursor = conn.cursor()
-    select_query = """
-        SELECT * FROM Users WHERE email = ? AND password = ?
-    """
-    cursor.execute(select_query, (email, password))
-    user = cursor.fetchone()
-    conn.close()
-    return user
+    with sqlite3.connect('MASTER.db') as conn:
+        password_hash = hash_password(password)
+        return conn.execute("""
+            SELECT * FROM Users 
+            WHERE email = ? AND password_hash = ?
+        """, (email, password_hash)).fetchone()
 
-def init_ses_states():
-    st.session_state.setdefault('chat_history', [])
-    st.session_state.setdefault('user', None)
-    st.session_state.setdefault('user_authenticated', False)  # Initialize user_authenticated
+# Cached Data Loading
+@st.cache_data(ttl=CACHE_EXPIRY)
+def load_data(tickers, start, end):
+    return yf.download(tickers, start, end, group_by='ticker')
 
-def relative_returns(df):
-    rel = df.pct_change()
-    cumret = ((1 + rel).cumprod() - 1).fillna(0)
-    return cumret
-
-def display_convo():
-    with st.container():
-        for i, message in enumerate(reversed(st.session_state.chat_history)):
-            if i % 2 == 0:
-                st.markdown(bot_template.replace("{{MSG}}", message), unsafe_allow_html=True)
-            else:
-                st.markdown(user_template.replace("{{MSG}}", message), unsafe_allow_html=True)
-
-def approve_password(password):
-    if len(password) >= 8 and re.search(r"(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[_@$#!?&*%])", password):
-        return True
-    return False
-
-def approve_email(email):
-    email_regex = '^[a-zA-Z0-9]+[\._]?[a-zA-Z0-9]+[@]\w+[.]\w{2,3}$'
-    if re.search(email_regex, email):
-        return True
-    else:
-        return False
-
-def get_line_chart(df):
-    fig = go.Figure(data=go.Scatter(x=df.index, y=df['Close'], mode='lines'))
+# Enhanced Visualization
+def create_candlestick_chart(df, ticker):
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name=ticker
+    )])
+    fig.update_layout(title=f'{ticker} Candlestick Chart', yaxis_title='Price')
     return fig
 
-def user_authentication_tab():
-    with st.expander("User Authentication", expanded=True):
-        login_tab, create_account_tab = st.tabs(["Login", "Create Account"])
+def create_technical_chart(df, ticker):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA'], name='SMA'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA'], name='EMA'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Upper Band'], name='Upper Band'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Lower Band'], name='Lower Band'))
+    fig.update_layout(title=f'{ticker} Technical Indicators', yaxis_title='Price')
+    return fig
 
-        with login_tab:
-            email = st.text_input("Email:") 
-            password = st.text_input("Password:", type='password')
-            if st.button("Login"):
-                user = authenticate_user(email=email, password=password)
-                if user and len(user) >= 3:
-                    st.session_state.user = {'email': user[1]}
-                    st.session_state.user_authenticated = True
-                else:
-                    st.caption('Incorrect Username or Password.')
+# Enhanced AI Chat
+def get_ai_response(query, context):
+    messages = [
+        {"role": "system", "content": "You are a financial analyst assistant. Provide detailed technical analysis."},
+        {"role": "user", "content": f"Analyze this query: {query}. Context: {context}"}
+    ]
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=0
+    )
+    return response.choices[0].message['content']
 
-            if st.session_state.user_authenticated and st.session_state.user:
-                st.caption(f"User Authenticated: {st.session_state.user['email']}")
-
-        with create_account_tab:
-            new_email = st.text_input("New Email:")
-            new_password = st.text_input("New Password:", type='password')
-            confirm_password = st.text_input("Confirm Password:", type='password')
-            if st.button("Create Account"):
-                if not approve_email(new_email):
-                    st.caption("Invalid Email")
-                    return
-                if not approve_password(new_password):
-                    st.caption("Invalid Password")
-                    return
-                if new_password != confirm_password:
-                    st.caption("Passwords do not match")
-                    return
-                add_user_to_db(email=new_email, password=new_password)
-                st.caption(f"{new_email} Successfully Added")
-
-def get_openai_response(prompt):
-    try:
-        response = openai.Completion.create(
-            engine="gpt-3.5-turbo-instruct",  # Use GPT-3.5 Turbo engine
-            prompt=prompt,
-            temperature=0.5,
-            max_tokens=150,
-            n=1,
-            stop=None,
-            timeout=15,
-        )
-        return response.choices[0].text.strip()
-
-    except Exception as e:
-        st.error(f"An error occurred while communicating with the OpenAI API: {str(e)}")
-
+# Main Application
 def main():
-    st.set_page_config(page_title="Stock Price AI Bot", page_icon=":chart:")
+    st.set_page_config(page_title="Advanced Stock AI", layout="wide")
     st.write(css, unsafe_allow_html=True)
     create_users_db()
-    init_ses_states()
-    st.title("Stock Price AI Bot")
-    st.caption("Visualizations and OpenAI Chatbot for Multiple Stocks Over A Specified Period")
-
+    
+    # Session State Management
+    if 'auth' not in st.session_state:
+        st.session_state.auth = False
+    if 'portfolio' not in st.session_state:
+        st.session_state.portfolio = []
+    
+    # Authentication Sidebar
     with st.sidebar:
-        user_authentication_tab()
+        if not st.session_state.auth:
+            st.title("🔒 Authentication")
+            auth_mode = st.radio("Choose:", ["Login", "Register"])
+            
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            
+            if st.button("Submit"):
+                if auth_mode == "Login":
+                    user = authenticate_user(email, password)
+                    if user:
+                        st.session_state.auth = True
+                        st.success("Login successful!")
+                    else:
+                        st.error("Invalid credentials")
+                else:
+                    if authenticate_user(email, password):
+                        st.error("User already exists")
+                    else:
+                        add_user_to_db(email, password)
+                        st.success("Account created successfully!")
+    
+    # Main Interface
+    if st.session_state.auth:
+        st.title("📈 Advanced Stock Analysis Platform")
+        
+        # Portfolio Management
+        with st.expander("💰 Portfolio Management"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_asset = st.text_input("Add Asset (Ticker)")
+                if st.button("Add to Portfolio"):
+                    if new_asset not in st.session_state.portfolio:
+                        st.session_state.portfolio.append(new_asset)
+            with col2:
+                selected_asset = st.selectbox("Remove Asset", st.session_state.portfolio)
+                if st.button("Remove"):
+                    st.session_state.portfolio.remove(selected_asset)
+        
+        # Data Analysis Section
+        with st.expander("📊 Market Analysis"):
+            selected_tickers = st.multiselect("Select Assets", st.session_state.portfolio)
+            start_date = st.date_input("Start Date", DEFAULT_START_DATE)
+            end_date = st.date_input("End Date", datetime.now())
+            
+            if selected_tickers:
+                data = load_data(selected_tickers, start_date, end_date)
+                
+                # Enhanced Visualization Tabs
+                tab1, tab2, tab3 = st.tabs(["Candlestick", "Technical", "Performance"])
+                
+                with tab1:
+                    for ticker in selected_tickers:
+                        st.plotly_chart(create_candlestick_chart(data[ticker], ticker))
+                
+                with tab2:
+                    for ticker in selected_tickers:
+                        analyzed_data = calculate_technical_indicators(data[ticker])
+                        st.plotly_chart(create_technical_chart(analyzed_data, ticker))
+                
+                with tab3:
+                    returns = data.xs('Close', axis=1, level=1).pct_change().cumsum()
+                    st.line_chart(returns)
+        
+        # AI Chat Interface
+        with st.expander("🤖 AI Analyst Assistant"):
+            user_query = st.text_area("Ask your financial question:")
+            if st.button("Analyze"):
+                context = f"Analyzing {selected_tickers} from {start_date} to {end_date}"
+                response = get_ai_response(user_query, context)
+                
+                st.markdown(bot_template.replace("{{MSG}}", response), unsafe_allow_html=True)
+                st.session_state.chat_history.append(response)
 
-    if st.session_state.get('user_authenticated', False):
-        with st.sidebar:
-            with st.expander("Settings", expanded=True):
-                # Updated list of available assets
-                asset_tickers = sorted(['DOW', 'NVDA', 'TSLA', 'GOOGL', 'AMZN', 'AI', 'NIO', 'LCID', 'F', 'LYFY', 'AAPL', 'MSFT', 'BTC-USD', 'ETH-USD', 'GOOG', 'NFLX', 'SPY'])
-                asset_dropdown = st.multiselect('Pick Assets:', asset_tickers)
-
-                metric_tickers = ['Adj. Close', 'Relative Returns']
-                metric_dropdown = st.selectbox("Metric", metric_tickers)
-
-                # Updated list of available charts
-                viz_tickers = ['Line Chart', 'Area Chart', 'Line Chart (OHLC Data)']
-                viz_dropdown = st.multiselect("Pick Charts:", viz_tickers)
-
-                start = st.date_input('Start', value=pd.to_datetime('2023-01-01'))
-                end = st.date_input('End', value=pd.to_datetime('today'))
-
-                chatbot_temp = st.slider("Chat Bot Temperature", 0.0, 1.0, 0.5)
-
-        if len(asset_dropdown) > 0:
-            df = yf.download(asset_dropdown, start, end)
-            if not df.empty:
-                df = df['Adj Close']
-                if metric_dropdown == 'Relative Returns':
-                    df = relative_returns(df)
-                if len(viz_dropdown) > 0:
-                    with st.expander("Data Visualizations for {} of {}".format(metric_dropdown, asset_dropdown), expanded=True):
-                        if "Line Chart" in viz_dropdown:
-                            st.subheader("Line Chart")
-                            st.line_chart(df)
-                        if "Area Chart" in viz_dropdown:
-                            st.subheader("Area Chart")
-                            st.area_chart(df)
-                        if "Line Chart (OHLC Data)" in viz_dropdown:
-                            st.subheader("Line Chart (OHLC Data)")
-                            st.plotly_chart(get_line_chart(df))
-
-            st.header("Chat with your Data")
-
-            query = st.text_input("Enter a query:")
-
-            if st.button("Execute") and query:
-                with st.spinner('Generating response...'):
-                    try:
-                        answer = get_openai_response(query)
-                        st.session_state.chat_history.append(f"USER: {query}\n")
-                        st.session_state.chat_history.append(f"AI: {answer}\n")
-                        display_convo()
-
-                    except Exception as e:
-                        st.error(f"An error occurred: {str(e)}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     load_dotenv()
     main()
